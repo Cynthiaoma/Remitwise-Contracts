@@ -183,6 +183,15 @@ const PENDING_REWARDS: Symbol = symbol_short!("PNDG_RWD");
 /// Storage key for the current actor epoch.
 /// Value type: `u64`.
 const ACTOR_EPOCH: Symbol = symbol_short!("ACT_EPOCH");
+/// Storage key prefix for pending dependency-update proposals.
+/// Value type: `PendingDependencyUpdate`, keyed by `(DEP_PEND, kind as u32)`.
+const DEP_PEND: Symbol = symbol_short!("DEP_PEND");
+/// Timelock (in seconds) that must elapse between proposing and executing a
+/// dependency update. 24 hours.
+const DEP_TIMELOCK_SECS: u64 = 86_400;
+/// Maximum number of `bump_cross_contract_epoch` calls allowed when
+/// provisioning a freshly deployed downstream contract during a rotation.
+const MAX_EPOCH_CATCHUP: u64 = 32;
 
 /// Pre-upgrade snapshot for upgrade rollback protection.
 ///
@@ -276,6 +285,40 @@ pub struct RemittanceFlowParams {
     pub goal_id: u32,
     pub bill_id: u32,
     pub policy_id: u32,
+}
+
+/// Identifies which downstream dependency a rotation proposal targets.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(u32)]
+pub enum DependencyKind {
+    FamilyWallet = 0,
+    RemittanceSplit = 1,
+    SavingsGoals = 2,
+    BillPayments = 3,
+    Insurance = 4,
+}
+
+impl DependencyKind {
+    /// Returns the instance-storage key holding this dependency's address.
+    fn storage_key(self) -> Symbol {
+        match self {
+            DependencyKind::FamilyWallet => symbol_short!("FW_ADDR"),
+            DependencyKind::RemittanceSplit => symbol_short!("RS_ADDR"),
+            DependencyKind::SavingsGoals => symbol_short!("SG_ADDR"),
+            DependencyKind::BillPayments => symbol_short!("BP_ADDR"),
+            DependencyKind::Insurance => symbol_short!("INS_ADDR"),
+        }
+    }
+}
+
+/// A pending, timelocked dependency-update proposal.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingDependencyUpdate {
+    pub kind: DependencyKind,
+    pub new_address: Address,
+    pub eta: u64,
 }
 
 /// Resolved downstream targets for the remittance fan-out.
@@ -388,6 +431,10 @@ pub enum OrchestratorError {
     SnapshotTooOld = 14,
     /// The actor epoch does not match the contract's current epoch.
     EpochMismatch = 15,
+    /// A dependency-update proposal was executed before its timelock elapsed.
+    TimelockNotElapsed = 16,
+    /// No pending dependency-update proposal exists for the requested kind.
+    NoPendingUpdate = 17,
 }
 
 #[contract]
@@ -622,6 +669,44 @@ impl Orchestrator {
         );
 
         Ok(true)
+    }
+
+    /// Validate that `new_address` may be configured as the dependency of
+    /// `kind`: it must not be the owner, must not be the orchestrator itself,
+    /// and must not collide with any *other* currently configured dependency.
+    ///
+    /// Shared by `init_internal` and `propose_dependency_update`.
+    fn validate_dependency_address(
+        env: &Env,
+        owner: &Address,
+        kind: DependencyKind,
+        new_address: &Address,
+    ) -> Result<(), OrchestratorError> {
+        let orch = env.current_contract_address();
+        if new_address == owner || new_address == &orch {
+            return Err(OrchestratorError::DuplicateDependency);
+        }
+        for other in [
+            DependencyKind::FamilyWallet,
+            DependencyKind::RemittanceSplit,
+            DependencyKind::SavingsGoals,
+            DependencyKind::BillPayments,
+            DependencyKind::Insurance,
+        ] {
+            if other == kind {
+                continue;
+            }
+            if let Some(existing) = env
+                .storage()
+                .instance()
+                .get::<Symbol, Address>(&other.storage_key())
+            {
+                if &existing == new_address {
+                    return Err(OrchestratorError::DuplicateDependency);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Execute a remittance flow with replay protection.
@@ -1119,6 +1204,217 @@ impl Orchestrator {
         );
 
         Ok(new_epoch)
+    }
+
+    /// Propose a timelocked update of one downstream dependency address.
+    ///
+    /// The proposal has no effect until [`Self::execute_dependency_update`] is
+    /// called by the owner after `DEP_TIMELOCK_SECS` have elapsed, giving users
+    /// time to observe the pending change on-chain.
+    ///
+    /// # Authorization
+    /// Only the contract owner may propose.
+    ///
+    /// # Errors
+    /// - `Unauthorized` if `caller` is not the owner
+    /// - `DuplicateDependency` if `new_address` is the owner, the orchestrator
+    ///   itself, or equal to another currently configured dependency
+    ///
+    /// # Events
+    /// Emits `(symbol_short!("orch"), symbol_short!("dep_prop"))` with
+    /// `(kind, new_address, eta)`.
+    pub fn propose_dependency_update(
+        env: Env,
+        caller: Address,
+        kind: DependencyKind,
+        new_address: Address,
+    ) -> Result<u64, OrchestratorError> {
+        caller.require_auth();
+        let owner: Address = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("OWNER"))
+            .ok_or(OrchestratorError::Unauthorized)?;
+        if caller != owner {
+            return Err(OrchestratorError::Unauthorized);
+        }
+
+        Self::validate_dependency_address(&env, &owner, kind, &new_address)?;
+
+        Self::extend_instance_ttl(&env);
+        let eta = env
+            .ledger()
+            .timestamp()
+            .checked_add(DEP_TIMELOCK_SECS)
+            .ok_or(OrchestratorError::Overflow)?;
+        let pending = PendingDependencyUpdate {
+            kind,
+            new_address: new_address.clone(),
+            eta,
+        };
+        env.storage()
+            .instance()
+            .set(&(DEP_PEND, kind as u32), &pending);
+
+        env.events().publish(
+            (symbol_short!("orch"), symbol_short!("dep_prop")),
+            (kind, new_address, eta),
+        );
+
+        Ok(eta)
+    }
+
+    /// Execute a previously proposed dependency update once its timelock has
+    /// elapsed.
+    ///
+    /// Before writing the new address, the target contract is provisioned so
+    /// its cross-contract epoch matches `ACTOR_EPOCH`:
+    /// - For `SavingsGoals`, `set_trusted_orchestrator(orch, orch)` is called
+    ///   first (the savings contract requires the orchestrator to self-register).
+    /// - For all kinds, the target's epoch is read; if it is ahead of
+    ///   `ACTOR_EPOCH` the update fails with `EpochMismatch`. Otherwise
+    ///   `bump_cross_contract_epoch` is called `ACTOR_EPOCH - e` times, capped
+    ///   at `MAX_EPOCH_CATCHUP`, and the epoch is re-read and required to equal
+    ///   `ACTOR_EPOCH`. Any failure reverts the whole update.
+    ///
+    /// # Authorization
+    /// Only the contract owner may execute.
+    ///
+    /// # Errors
+    /// - `Unauthorized` if `caller` is not the owner
+    /// - `NoPendingUpdate` if no proposal exists for `kind`
+    /// - `TimelockNotElapsed` if `now < eta`
+    /// - `ExecutionLocked` if a flow is in progress
+    /// - `EpochMismatch` if the new contract's epoch cannot be reconciled
+    ///
+    /// # Events
+    /// Emits `(symbol_short!("orch"), symbol_short!("dep_upd"))` with
+    /// `(kind, old_address, new_address)`.
+    pub fn execute_dependency_update(
+        env: Env,
+        caller: Address,
+        kind: DependencyKind,
+    ) -> Result<bool, OrchestratorError> {
+        caller.require_auth();
+        let owner: Address = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("OWNER"))
+            .ok_or(OrchestratorError::Unauthorized)?;
+        if caller != owner {
+            return Err(OrchestratorError::Unauthorized);
+        }
+
+        let pending: PendingDependencyUpdate = env
+            .storage()
+            .instance()
+            .get(&(DEP_PEND, kind as u32))
+            .ok_or(OrchestratorError::NoPendingUpdate)?;
+        if env.ledger().timestamp() < pending.eta {
+            return Err(OrchestratorError::TimelockNotElapsed);
+        }
+
+        Self::require_no_pending_ops(&env)?;
+        Self::extend_instance_ttl(&env);
+
+        let orch = env.current_contract_address();
+        let target_epoch = Self::get_actor_epoch(&env);
+
+        // Provision the new contract so its cross-contract epoch matches ours.
+        // A freshly deployed contract starts at epoch 0 and only the trusted
+        // orchestrator may advance it.
+        if kind == DependencyKind::SavingsGoals {
+            // `savings_goals::set_trusted_orchestrator` requires the caller to
+            // be the orchestrator itself, so we self-register here.
+            let sg = interface::SavingsGoalsClient::new(&env, &pending.new_address);
+            sg.set_trusted_orchestrator(&orch, &orch);
+        }
+
+        let current: u64 = env.invoke_contract(
+            &pending.new_address,
+            &Symbol::new(&env, "get_cross_contract_epoch"),
+            soroban_sdk::vec![&env],
+        );
+        if current > target_epoch {
+            return Err(OrchestratorError::EpochMismatch);
+        }
+        let needed = target_epoch - current;
+        if needed > MAX_EPOCH_CATCHUP {
+            return Err(OrchestratorError::EpochMismatch);
+        }
+        for _ in 0..needed {
+            let _: u64 = env.invoke_contract(
+                &pending.new_address,
+                &Symbol::new(&env, "bump_cross_contract_epoch"),
+                soroban_sdk::vec![&env, orch.clone().into()],
+            );
+        }
+        let after: u64 = env.invoke_contract(
+            &pending.new_address,
+            &Symbol::new(&env, "get_cross_contract_epoch"),
+            soroban_sdk::vec![&env],
+        );
+        if after != target_epoch {
+            return Err(OrchestratorError::EpochMismatch);
+        }
+
+        let key = kind.storage_key();
+        let old: Option<Address> = env.storage().instance().get(&key);
+        env.storage()
+            .instance()
+            .set(&key, &pending.new_address);
+        env.storage()
+            .instance()
+            .remove(&(DEP_PEND, kind as u32));
+
+        env.events().publish(
+            (symbol_short!("orch"), symbol_short!("dep_upd")),
+            (kind, old, pending.new_address),
+        );
+
+        Ok(true)
+    }
+
+    /// Cancel a pending dependency-update proposal.
+    ///
+    /// # Authorization
+    /// Only the contract owner may cancel.
+    ///
+    /// # Errors
+    /// - `Unauthorized` if `caller` is not the owner
+    /// - `NoPendingUpdate` if no proposal exists for `kind`
+    pub fn cancel_dependency_update(
+        env: Env,
+        caller: Address,
+        kind: DependencyKind,
+    ) -> Result<bool, OrchestratorError> {
+        caller.require_auth();
+        let owner: Address = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("OWNER"))
+            .ok_or(OrchestratorError::Unauthorized)?;
+        if caller != owner {
+            return Err(OrchestratorError::Unauthorized);
+        }
+        let key = (DEP_PEND, kind as u32);
+        if !env.storage().instance().has(&key) {
+            return Err(OrchestratorError::NoPendingUpdate);
+        }
+        env.storage().instance().remove(&key);
+        env.events().publish(
+            (symbol_short!("orch"), symbol_short!("dep_cncl")),
+            kind,
+        );
+        Ok(true)
+    }
+
+    /// Return the pending dependency-update proposal for `kind`, if any.
+    pub fn get_pending_dependency_update(
+        env: Env,
+        kind: DependencyKind,
+    ) -> Option<PendingDependencyUpdate> {
+        env.storage().instance().get(&(DEP_PEND, kind as u32))
     }
 
     /// Advance the cross-contract epoch on every configured downstream contract.
