@@ -38,25 +38,47 @@ struct MockDownstream;
 
 #[contractimpl]
 impl MockDownstream {
-    pub fn check_spending_limit(_env: Env, _orchestrator: Address, _epoch: u64, _user: Address, _amount: i128) -> bool {
+    pub fn check_spending_limit(
+        _env: Env,
+        _orchestrator: Address,
+        _epoch: u64,
+        _user: Address,
+        _amount: i128,
+    ) -> bool {
         true
     }
-    pub fn calculate_split(env: Env, _orchestrator: Address, _epoch: u64, _total_amount: i128) -> Vec<i128> {
+    pub fn calculate_split(
+        env: Env,
+        _orchestrator: Address,
+        _epoch: u64,
+        _total_amount: i128,
+    ) -> Vec<i128> {
         soroban_sdk::vec![&env, 2500i128, 2500i128, 2500i128, 2500i128]
     }
-    pub fn add_to_goal(_env: Env, _orchestrator: Address, _epoch: u64, _caller: Address, _goal_id: u32, _amount: i128) {}
-    pub fn pay_bill(_env: Env, _orchestrator: Address, _epoch: u64, _caller: Address, _bill_id: u32) {}
-    pub fn pay_premium(_env: Env, _orchestrator: Address, _epoch: u64, _caller: Address, _policy_id: u32) {}
-    pub fn bump_cross_contract_epoch(env: Env, _orchestrator: Address) {
-        let key = symbol_short!("EPOCH");
-        let epoch: u64 = env.storage().instance().get(&key).unwrap_or(0);
-        env.storage().instance().set(&key, &(epoch + 1));
+    pub fn add_to_goal(
+        _env: Env,
+        _orchestrator: Address,
+        _epoch: u64,
+        _caller: Address,
+        _goal_id: u32,
+        _amount: i128,
+    ) {
     }
-    pub fn get_cross_contract_epoch(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&symbol_short!("EPOCH"))
-            .unwrap_or(0)
+    pub fn pay_bill(
+        _env: Env,
+        _orchestrator: Address,
+        _epoch: u64,
+        _caller: Address,
+        _bill_id: u32,
+    ) {
+    }
+    pub fn pay_premium(
+        _env: Env,
+        _orchestrator: Address,
+        _epoch: u64,
+        _caller: Address,
+        _policy_id: u32,
+    ) {
     }
 }
 

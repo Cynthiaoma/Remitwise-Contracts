@@ -156,7 +156,7 @@ pub struct InsuranceReport {
 /// See `reporting/docs/FAMILY_SPENDING_REPORT.md` for the full schema and
 /// `DataAvailability` degradation rules.
 #[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FamilySpendingReport {
     pub member_breakdown: Vec<FamilyMemberSpending>,
     pub total_members: u32,
@@ -169,7 +169,7 @@ pub struct FamilySpendingReport {
 
 /// Per-member family spending breakdown entry.
 #[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FamilyMemberSpending {
     /// Family-wallet member address.
     pub member: Address,
@@ -205,7 +205,7 @@ pub struct FinancialHealthReport {
 ///
 /// Returned `items` are capped to [`MAX_ITEMS_PER_REPORT`] (no padding).
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TopNBillsReport {
     pub items: Vec<Bill>,
     pub total_amount: i128,
@@ -223,7 +223,7 @@ pub struct TopNBillsReport {
 ///
 /// Returned `items` are capped to [`MAX_ITEMS_PER_REPORT`] (no padding).
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TopNSavingsReport {
     pub items: Vec<SavingsGoal>,
     pub total_target: i128,
@@ -236,7 +236,7 @@ pub struct TopNSavingsReport {
 
 /// Contract addresses configuration
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ContractAddresses {
     pub remittance_split: Address,
     pub savings_goals: Address,
@@ -502,7 +502,7 @@ pub trait FamilyWalletTrait {
 
 // Data structures from other contracts (needed for client traits)
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SavingsGoal {
     pub id: u32,
     pub owner: Address,
@@ -516,7 +516,7 @@ pub struct SavingsGoal {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GoalPage {
     pub items: Vec<SavingsGoal>,
     pub next_cursor: u32,
@@ -524,7 +524,7 @@ pub struct GoalPage {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Bill {
     pub id: u32,
     pub owner: Address,
@@ -543,7 +543,7 @@ pub struct Bill {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BillPage {
     pub items: Vec<Bill>,
     pub next_cursor: u32,
