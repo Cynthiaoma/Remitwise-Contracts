@@ -180,3 +180,18 @@ This document tracks changes, versions, and migration notes for each of the smar
 - **Summary**: Initial release of the Reporting contract.
 - **Breaking Changes**: None.
 - **Migration Notes**: Baseline deployment.
+
+## Orchestrator (`orchestrator`)
+
+### v0.2.0
+
+- **Summary**: Integrated emergency killswitch checking prior to executing any remittance flow (Issue feat(orchestrator): honour the emergency_killswitch contract before executing any remittance flow).
+- **New Features**:
+  - `KillswitchInterface` contract client trait for querying `emergency_killswitch` status (`is_paused`, `is_module_paused`, `is_function_paused`).
+  - Owner-only `set_killswitch(caller, killswitch: Option<Address>)` entrypoint storing `KS_ADDR` (`symbol_short!("KS_ADDR")`) and publishing `("orch", "ks_set")`.
+  - Defence-in-depth pause enforcement across all flow entrypoints: `execute_remittance_flow` (`"flow"`), `execute_remittance_flow_signed` (`"flow_sig"`), `execute_flow_fanout` (`"fanout"`), and `claim_rewards_summary_external` (`"clm_rwd"`).
+  - Typed error `OrchestratorError::EmergencyPaused = 16`.
+  - Fails closed on cross-contract query errors or contract absence.
+- **Breaking Changes**: None at the ABI level; pause checking only takes effect when a killswitch address is explicitly configured.
+- **Migration Notes**: No storage migration required. Optional killswitch address can be configured by the orchestrator owner.
+

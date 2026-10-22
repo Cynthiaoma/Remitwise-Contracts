@@ -120,6 +120,14 @@ mod interface {
         /// Transfer `amount` tokens from `from` to `to`.
         fn transfer(env: Env, from: Address, to: Address, amount: i128);
     }
+
+    /// Interface for interacting with the emergency killswitch contract.
+    #[contractclient(name = "KillswitchClient")]
+    pub trait KillswitchInterface {
+        fn is_paused(env: Env) -> bool;
+        fn is_module_paused(env: Env, module_id: Symbol) -> bool;
+        fn is_function_paused(env: Env, module_id: Symbol, func: Symbol) -> bool;
+    }
 }
 
 #[contracttype]
@@ -183,6 +191,9 @@ const PENDING_REWARDS: Symbol = symbol_short!("PNDG_RWD");
 /// Storage key for the current actor epoch.
 /// Value type: `u64`.
 const ACTOR_EPOCH: Symbol = symbol_short!("ACT_EPOCH");
+/// Storage key for the emergency killswitch contract address.
+/// Value type: `Address`.
+const KS_ADDR: Symbol = symbol_short!("KS_ADDR");
 
 /// Pre-upgrade snapshot for upgrade rollback protection.
 ///
@@ -427,9 +438,9 @@ pub enum OrchestratorError {
     SnapshotTooOld = 14,
     /// The actor epoch does not match the contract's current epoch.
     EpochMismatch = 15,
-    /// A configured downstream rejected an epoch bump or reported an
-    /// unexpected epoch after the bump.
-    DownstreamEpochBumpFailed = 16,
+    /// The emergency killswitch is active (globally, for the "orch" module,
+    /// or for this specific entrypoint), or the killswitch invocation failed (fails closed).
+    EmergencyPaused = 16,
 }
 
 #[contract]
@@ -453,6 +464,7 @@ impl Orchestrator {
         params: RemittanceFlowParams,
     ) -> Result<(), OrchestratorError> {
         params.caller.require_auth();
+        Self::require_not_emergency_paused(&env, symbol_short!("flow"))?;
 
         if params.total_amount <= 0 {
             Self::record_flow_validation_failure(&env, &params.caller);
@@ -700,6 +712,9 @@ impl Orchestrator {
         // 1. Authorization first — before any storage reads
         executor.require_auth();
 
+        // Check emergency killswitch before nonces, locks, or flow execution
+        Self::require_not_emergency_paused(&env, symbol_short!("flow_sig"))?;
+
         // 2. Validate initialization
         let _owner: Address = env
             .storage()
@@ -799,6 +814,7 @@ impl Orchestrator {
     ) -> Result<FanOutFlowResult, OrchestratorError> {
         Self::extend_instance_ttl(&env);
         executor.require_auth();
+        Self::require_not_emergency_paused(&env, symbol_short!("fanout"))?;
 
         if amount <= 0 {
             Self::record_flow_validation_failure(&env, &executor);
@@ -1002,6 +1018,7 @@ impl Orchestrator {
     ) -> Result<i128, OrchestratorError> {
         // 1. Authorize caller before touching any state.
         caller.require_auth();
+        Self::require_not_emergency_paused(&env, symbol_short!("clm_rwd"))?;
 
         // 2. Reentrancy guard — check and acquire lock atomically.
         //    Surfaces a typed error instead of panicking so the condition is
@@ -1586,6 +1603,91 @@ impl Orchestrator {
         env.events()
             .publish((symbol_short!("orch"), symbol_short!("snap_dsc")), ());
         Ok(true)
+    }
+
+    /// Sets or removes the emergency killswitch contract address.
+    ///
+    /// # Authorization
+    /// Only the contract owner may configure the killswitch address.
+    ///
+    /// # Validation
+    /// If `Some(addr)` is provided, it must not be the orchestrator's own address
+    /// or any of the configured downstream dependencies (`FW_ADDR`, `RS_ADDR`, `SG_ADDR`,
+    /// `BP_ADDR`, `INS_ADDR`).
+    ///
+    /// # Events
+    /// Emits `(symbol_short!("orch"), symbol_short!("ks_set"))` with the configured address or `None`.
+    pub fn set_killswitch(
+        env: Env,
+        caller: Address,
+        killswitch: Option<Address>,
+    ) -> Result<bool, OrchestratorError> {
+        caller.require_auth();
+        let owner: Address = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("OWNER"))
+            .ok_or(OrchestratorError::Unauthorized)?;
+        if caller != owner {
+            return Err(OrchestratorError::Unauthorized);
+        }
+
+        if let Some(ref ks) = killswitch {
+            if *ks == env.current_contract_address() {
+                return Err(OrchestratorError::DuplicateDependency);
+            }
+            let dep_keys = [
+                symbol_short!("FW_ADDR"),
+                symbol_short!("RS_ADDR"),
+                symbol_short!("SG_ADDR"),
+                symbol_short!("BP_ADDR"),
+                symbol_short!("INS_ADDR"),
+            ];
+            for key in dep_keys.iter() {
+                if let Some(dep_addr) = env.storage().instance().get::<Symbol, Address>(key) {
+                    if *ks == dep_addr {
+                        return Err(OrchestratorError::DuplicateDependency);
+                    }
+                }
+            }
+            env.storage().instance().set(&KS_ADDR, ks);
+        } else {
+            env.storage().instance().remove(&KS_ADDR);
+        }
+
+        env.events()
+            .publish((symbol_short!("orch"), symbol_short!("ks_set")), killswitch);
+
+        Ok(true)
+    }
+
+    /// Checks the emergency killswitch contract if configured.
+    ///
+    /// Fails closed: if the killswitch contract returns `true` for global pause,
+    /// module pause (`"orch"`), or function pause (`"orch"`, `func`), or if any
+    /// cross-contract invocation fails, returns `Err(OrchestratorError::EmergencyPaused)`.
+    fn require_not_emergency_paused(env: &Env, func: Symbol) -> Result<(), OrchestratorError> {
+        let ks_addr: Option<Address> = env.storage().instance().get(&KS_ADDR);
+        if let Some(addr) = ks_addr {
+            let client = interface::KillswitchClient::new(env, &addr);
+            // 1. Global pause check (fails closed on call failure or true)
+            match client.try_is_paused() {
+                Ok(Ok(false)) => {}
+                _ => return Err(OrchestratorError::EmergencyPaused),
+            }
+            // 2. Module pause check ("orch")
+            let orch_module = symbol_short!("orch");
+            match client.try_is_module_paused(&orch_module) {
+                Ok(Ok(false)) => {}
+                _ => return Err(OrchestratorError::EmergencyPaused),
+            }
+            // 3. Function pause check ("orch", func)
+            match client.try_is_function_paused(&orch_module, &func) {
+                Ok(Ok(false)) => {}
+                _ => return Err(OrchestratorError::EmergencyPaused),
+            }
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

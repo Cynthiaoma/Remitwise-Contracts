@@ -284,10 +284,11 @@ All per-user and per-record collections are stored in persistent storage using t
 
 ### Keys and value types (instance storage)
 
-| Key     | Type                          | Notes                        |
-| ------- | ----------------------------- | ---------------------------- |
-| `STATS` | `ExecutionStats`              | Aggregate execution counters |
-| `AUDIT` | `Vec<OrchestratorAuditEntry>` | Rotating audit log, max 100  |
+| Key       | Type                          | Notes                                     |
+| --------- | ----------------------------- | ----------------------------------------- |
+| `STATS`   | `ExecutionStats`              | Aggregate execution counters              |
+| `AUDIT`   | `Vec<OrchestratorAuditEntry>` | Rotating audit log, max 100               |
+| `KS_ADDR` | `Address`                     | Emergency killswitch contract address     |
 
 ### TTL and IDs
 
