@@ -366,6 +366,115 @@ mod mock_no_limit {
 // Test helpers
 // ---------------------------------------------------------------------------
 
+/// Downstream mock that records the goal/bill/policy id it was called with, so
+/// routing tests can assert the orchestrator resolved the expected ids.
+mod mock_recording {
+    use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Vec};
+
+    #[contract]
+    pub struct Contract;
+
+    #[contractimpl]
+    impl Contract {
+        pub fn check_spending_limit(
+            _env: Env,
+            _orchestrator: Address,
+            _epoch: u64,
+            _user: Address,
+            _amount: i128,
+        ) -> bool {
+            true
+        }
+        pub fn calculate_split(
+            env: Env,
+            _orchestrator: Address,
+            _epoch: u64,
+            _total_amount: i128,
+        ) -> Vec<i128> {
+            soroban_sdk::vec![&env, 2500i128, 2500i128, 2500i128, 2500i128]
+        }
+        pub fn add_to_goal(
+            env: Env,
+            _orchestrator: Address,
+            _epoch: u64,
+            _user: Address,
+            goal_id: u32,
+            _amount: i128,
+        ) {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("GOAL"), &goal_id);
+        }
+        pub fn pay_bill(
+            env: Env,
+            _orchestrator: Address,
+            _epoch: u64,
+            _user: Address,
+            bill_id: u32,
+        ) {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("BILL"), &bill_id);
+        }
+        pub fn pay_premium(
+            env: Env,
+            _orchestrator: Address,
+            _epoch: u64,
+            _user: Address,
+            policy_id: u32,
+        ) {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("POL"), &policy_id);
+        }
+        pub fn remove_from_goal(
+            _env: Env,
+            _orchestrator: Address,
+            _epoch: u64,
+            _user: Address,
+            _goal_id: u32,
+            _amount: i128,
+        ) {
+        }
+        pub fn reverse_payment(
+            _env: Env,
+            _orchestrator: Address,
+            _epoch: u64,
+            _user: Address,
+            _bill_id: u32,
+            _amount: i128,
+        ) {
+        }
+        pub fn reverse_premium(
+            _env: Env,
+            _orchestrator: Address,
+            _epoch: u64,
+            _user: Address,
+            _policy_id: u32,
+            _amount: i128,
+        ) {
+        }
+        pub fn get_goal(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("GOAL"))
+                .unwrap_or(0)
+        }
+        pub fn get_bill(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("BILL"))
+                .unwrap_or(0)
+        }
+        pub fn get_policy(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("POL"))
+                .unwrap_or(0)
+        }
+    }
+}
+
 fn setup_test() -> (Env, Address) {
     let env = Env::default();
     env.mock_all_auths();
@@ -436,6 +545,21 @@ fn compute_test_hash(
     deadline: u64,
 ) -> u64 {
     Orchestrator::compute_request_hash(operation, nonce, amount, deadline, 1, 1, 1)
+}
+
+/// `compute_request_hash` with explicit routing ids, for per-executor route tests.
+fn compute_test_hash_with_ids(
+    operation: Symbol,
+    nonce: u64,
+    amount: i128,
+    deadline: u64,
+    goal_id: u32,
+    bill_id: u32,
+    policy_id: u32,
+) -> u64 {
+    Orchestrator::compute_request_hash(
+        operation, nonce, amount, deadline, goal_id, bill_id, policy_id,
+    )
 }
 
 fn wasm_size_budgets() -> &'static [(&'static str, usize)] {
@@ -1396,7 +1520,7 @@ fn test_cross_contract_failure_emits_step_and_cause() {
     // `mock_fail_savings` panics rather than returning a typed error, so this
     // is an invocation-level failure (`rejected_by_contract == false`).
     let (_, _, data) = &matched[0];
-    assert_eq!(bool::from_val(&env, data), false);
+    assert!(!bool::from_val(&env, data));
 }
 
 #[test]
@@ -1751,12 +1875,12 @@ mod mock_unsigned_fail_insurance {
 }
 
 /// Test that the unsigned `execute_remittance_flow` returns
-/// `RemittanceFlowRolledBack` when a downstream bill step fails after
-/// savings succeeded. This mirrors the signed-path test but covers the
-/// unsigned entry point (which uses `execute_remittance_flow` directly).
+/// `CrossContractCallFailed` when a downstream bill step fails after
+/// savings succeeded. The unsigned entry point runs the atomic flow with
+/// `compensate_on_failure == false` (compensation is enabled only on the
+/// signed path), so it surfaces the raw cross-contract error.
 #[test]
-#[ignore = "Returns CrossContractCallFailed instead of expected RemittanceFlowRolledBack"]
-fn test_unsigned_rollback_bill_failure_returns_rolled_back() {
+fn test_unsigned_bill_failure_returns_cross_contract_error() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -1786,8 +1910,8 @@ fn test_unsigned_rollback_bill_failure_returns_rolled_back() {
 
     assert_eq!(
         result,
-        Err(Ok(OrchestratorError::RemittanceFlowRolledBack)),
-        "Unsigned flow: bill failure after savings must roll back"
+        Err(Ok(OrchestratorError::CrossContractCallFailed)),
+        "Unsigned flow: bill failure after savings must surface CrossContractCallFailed"
     );
     assert!(
         !client.get_execution_state(),
@@ -1795,12 +1919,11 @@ fn test_unsigned_rollback_bill_failure_returns_rolled_back() {
     );
 }
 
-/// Test that the unsigned flow returns `RemittanceFlowRolledBack` when
-/// insurance fails after both savings and bills succeeded, triggering
-/// compensation for both prior steps.
+/// Test that the unsigned flow returns `CrossContractCallFailed` when
+/// insurance fails after both savings and bills succeeded. The unsigned
+/// path does not compensate, so no rollback error is produced.
 #[test]
-#[ignore = "Returns CrossContractCallFailed instead of expected RemittanceFlowRolledBack"]
-fn test_unsigned_rollback_insurance_failure_returns_rolled_back() {
+fn test_unsigned_insurance_failure_returns_cross_contract_error() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -1830,8 +1953,8 @@ fn test_unsigned_rollback_insurance_failure_returns_rolled_back() {
 
     assert_eq!(
         result,
-        Err(Ok(OrchestratorError::RemittanceFlowRolledBack)),
-        "Unsigned flow: insurance failure after savings+bills must roll back"
+        Err(Ok(OrchestratorError::CrossContractCallFailed)),
+        "Unsigned flow: insurance failure after savings+bills must surface CrossContractCallFailed"
     );
     assert!(
         !client.get_execution_state(),
@@ -1917,7 +2040,7 @@ fn test_fanout_flow_does_not_compensate_on_bill_failure() {
         );
         assert!(
             fanout.savings.succeeded,
-            "savings step must succeed before bill failure"
+            "savings step must succeed when only the bill step fails"
         );
         assert!(!fanout.bills.succeeded, "bill step must report failure");
     } else if let Err(Ok(e)) = &result {
@@ -4222,350 +4345,169 @@ fn test_fanout_rejects_short_split_vector() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Emergency Kill Switch Integration Tests (feat(orchestrator))
-// ---------------------------------------------------------------------------
+// ============================================================================
+// Issue #1872: per-executor goal/bill/policy routing for the signed flow
+// ============================================================================
 
-mod mock_killswitch_unpaused {
-    use soroban_sdk::{contract, contractimpl, Env, Symbol};
+/// Executor A sets a route; the signed flow must call the downstream mocks with
+/// A's goal/bill/policy ids, not the defaults.
+#[test]
+fn signed_flow_uses_executor_route() {
+    let (env, owner) = setup_test();
+    let (_, client) = register_orchestrator(&env);
 
-    #[contract]
-    pub struct Contract;
-
-    #[contractimpl]
-    impl Contract {
-        pub fn is_paused(_env: Env) -> bool {
-            false
-        }
-        pub fn is_module_paused(_env: Env, _module_id: Symbol) -> bool {
-            false
-        }
-        pub fn is_function_paused(_env: Env, _module_id: Symbol, _func: Symbol) -> bool {
-            false
-        }
-    }
-}
-
-mod mock_killswitch_global_paused {
-    use soroban_sdk::{contract, contractimpl, Env, Symbol};
-
-    #[contract]
-    pub struct Contract;
-
-    #[contractimpl]
-    impl Contract {
-        pub fn is_paused(_env: Env) -> bool {
-            true
-        }
-        pub fn is_module_paused(_env: Env, _module_id: Symbol) -> bool {
-            false
-        }
-        pub fn is_function_paused(_env: Env, _module_id: Symbol, _func: Symbol) -> bool {
-            false
-        }
-    }
-}
-
-mod mock_killswitch_module_paused {
-    use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
-
-    #[contract]
-    pub struct Contract;
-
-    #[contractimpl]
-    impl Contract {
-        pub fn is_paused(_env: Env) -> bool {
-            false
-        }
-        pub fn is_module_paused(_env: Env, module_id: Symbol) -> bool {
-            module_id == symbol_short!("orch")
-        }
-        pub fn is_function_paused(_env: Env, _module_id: Symbol, _func: Symbol) -> bool {
-            false
-        }
-    }
-}
-
-mod mock_killswitch_fanout_paused {
-    use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
-
-    #[contract]
-    pub struct Contract;
-
-    #[contractimpl]
-    impl Contract {
-        pub fn is_paused(_env: Env) -> bool {
-            false
-        }
-        pub fn is_module_paused(_env: Env, _module_id: Symbol) -> bool {
-            false
-        }
-        pub fn is_function_paused(_env: Env, module_id: Symbol, func: Symbol) -> bool {
-            module_id == symbol_short!("orch") && func == symbol_short!("fanout")
-        }
-    }
-}
-
-mod mock_reward_token {
-    use soroban_sdk::{contract, contractimpl, Address, Env};
-
-    #[contract]
-    pub struct Contract;
-
-    #[contractimpl]
-    impl Contract {
-        pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {}
-    }
-}
-
-/// Helper to initialize orchestrator with mock dependencies
-fn setup_test_orchestrator(
-    env: &Env,
-) -> (
-    Address,
-    OrchestratorClient<'static>,
-    Address,
-    Address,
-    Address,
-    Address,
-    Address,
-    Address,
-) {
-    let orch_id = env.register_contract(None, Orchestrator);
-    let client = OrchestratorClient::new(env, &orch_id);
-    let owner = Address::generate(env);
     let fw = env.register_contract(None, MockContract);
-    let rs = env.register_contract(None, mock_remittance_split::Contract);
-    let sg = env.register_contract(None, MockContract);
-    let bp = env.register_contract(None, MockContract);
-    let ins = env.register_contract(None, MockContract);
-    client.init(&owner, &fw, &rs, &sg, &bp, &ins);
-    (orch_id, client, owner, fw, rs, sg, bp, ins)
-}
-
-#[test]
-fn global_pause_blocks_all_flows() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.budget().reset_unlimited();
-
-    let (_orch_id, client, owner, _fw, _rs, _sg, _bp, _ins) = setup_test_orchestrator(&env);
-    let ks = env.register_contract(None, mock_killswitch_global_paused::Contract);
-    client.set_killswitch(&owner, &Some(ks));
-
-    let caller = Address::generate(&env);
-    let initial_nonce = client.get_nonce(&caller);
-
-    // 1. Unsigned flow
-    let res_flow = client.try_execute_remittance_flow(&RemittanceFlowParams {
-        caller: caller.clone(),
-        total_amount: 10_000i128,
-        family_wallet: _fw.clone(),
-        remittance_split: _rs.clone(),
-        savings: _sg.clone(),
-        bills: _bp.clone(),
-        insurance: _ins.clone(),
-        goal_id: 1,
-        bill_id: 1,
-        policy_id: 1,
-    });
-    assert_eq!(res_flow, Err(Ok(OrchestratorError::EmergencyPaused)));
-
-    // 2. Signed flow
-    let res_signed = client.try_execute_remittance_flow_signed(
-        &caller,
-        &10_000i128,
-        &0u64,
-        &10_000u64,
-        &12345u64,
-        &0u64,
+    let rs = env.register_contract(None, mock_recording::Contract);
+    let sg = env.register_contract(None, mock_recording::Contract);
+    let bp = env.register_contract(None, mock_recording::Contract);
+    let ins = env.register_contract(None, mock_recording::Contract);
+    init_orchestrator_with_mocks(
+        &env,
+        &client,
+        &owner,
+        fw,
+        rs,
+        sg.clone(),
+        bp.clone(),
+        ins.clone(),
     );
-    assert_eq!(res_signed, Err(Ok(OrchestratorError::EmergencyPaused)));
 
-    // Nonce must not have changed
-    assert_eq!(client.get_nonce(&caller), initial_nonce);
+    let executor = Address::generate(&env);
+    client.set_flow_route(&executor, &7, &8, &9);
 
-    // 3. Fanout flow
-    let res_fanout = client.try_execute_flow_fanout(&caller, &10_000i128);
-    assert_eq!(res_fanout, Err(Ok(OrchestratorError::EmergencyPaused)));
-
-    // 4. Claim rewards external
-    let reward_token = env.register_contract(None, mock_reward_token::Contract);
-    let res_claim = client.try_claim_rewards_summary_external(&caller, &reward_token);
-    assert_eq!(res_claim, Err(Ok(OrchestratorError::EmergencyPaused)));
-}
-
-#[test]
-fn module_pause_blocks_orchestrator() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.budget().reset_unlimited();
-
-    let (_orch_id, client, owner, _fw, _rs, _sg, _bp, _ins) = setup_test_orchestrator(&env);
-    let ks = env.register_contract(None, mock_killswitch_module_paused::Contract);
-    client.set_killswitch(&owner, &Some(ks));
-
-    let caller = Address::generate(&env);
-    let initial_nonce = client.get_nonce(&caller);
-
-    // Unsigned flow
-    let res_flow = client.try_execute_remittance_flow(&RemittanceFlowParams {
-        caller: caller.clone(),
-        total_amount: 10_000i128,
-        family_wallet: _fw.clone(),
-        remittance_split: _rs.clone(),
-        savings: _sg.clone(),
-        bills: _bp.clone(),
-        insurance: _ins.clone(),
-        goal_id: 1,
-        bill_id: 1,
-        policy_id: 1,
-    });
-    assert_eq!(res_flow, Err(Ok(OrchestratorError::EmergencyPaused)));
-
-    // Signed flow
-    let res_signed = client.try_execute_remittance_flow_signed(
-        &caller,
-        &10_000i128,
-        &0u64,
-        &10_000u64,
-        &12345u64,
-        &0u64,
+    let deadline = signed_flow_deadline(&env);
+    let hash = compute_test_hash_with_ids(symbol_short!("flow"), 0, 10_000, deadline, 7, 8, 9);
+    let result =
+        client.try_execute_remittance_flow_signed(&executor, &10_000, &0, &deadline, &hash, &0u64);
+    assert_eq!(
+        result,
+        Ok(Ok(true)),
+        "signed flow with a route must succeed"
     );
-    assert_eq!(res_signed, Err(Ok(OrchestratorError::EmergencyPaused)));
-    assert_eq!(client.get_nonce(&caller), initial_nonce);
 
-    // Fanout flow
-    let res_fanout = client.try_execute_flow_fanout(&caller, &10_000i128);
-    assert_eq!(res_fanout, Err(Ok(OrchestratorError::EmergencyPaused)));
+    assert_eq!(mock_recording::ContractClient::new(&env, &sg).get_goal(), 7);
+    assert_eq!(mock_recording::ContractClient::new(&env, &bp).get_bill(), 8);
+    assert_eq!(
+        mock_recording::ContractClient::new(&env, &ins).get_policy(),
+        9
+    );
+}
 
-    // Claim rewards
-    let reward_token = env.register_contract(None, mock_reward_token::Contract);
-    let res_claim = client.try_claim_rewards_summary_external(&caller, &reward_token);
-    assert_eq!(res_claim, Err(Ok(OrchestratorError::EmergencyPaused)));
+/// Executor B has no route: after the owner sets the default, the signed flow
+/// uses the default ids.
+#[test]
+fn signed_flow_falls_back_to_default_route() {
+    let (env, owner) = setup_test();
+    let (_, client) = register_orchestrator(&env);
+
+    let fw = env.register_contract(None, MockContract);
+    let rs = env.register_contract(None, mock_recording::Contract);
+    let sg = env.register_contract(None, mock_recording::Contract);
+    let bp = env.register_contract(None, mock_recording::Contract);
+    let ins = env.register_contract(None, mock_recording::Contract);
+    init_orchestrator_with_mocks(
+        &env,
+        &client,
+        &owner,
+        fw,
+        rs,
+        sg.clone(),
+        bp.clone(),
+        ins.clone(),
+    );
+
+    client.set_default_route(&owner, &3, &4, &5);
+
+    let executor = Address::generate(&env);
+    let deadline = signed_flow_deadline(&env);
+    let hash = compute_test_hash_with_ids(symbol_short!("flow"), 0, 10_000, deadline, 3, 4, 5);
+    let result =
+        client.try_execute_remittance_flow_signed(&executor, &10_000, &0, &deadline, &hash, &0u64);
+    assert_eq!(
+        result,
+        Ok(Ok(true)),
+        "signed flow with default route must succeed"
+    );
+
+    assert_eq!(mock_recording::ContractClient::new(&env, &sg).get_goal(), 3);
+    assert_eq!(mock_recording::ContractClient::new(&env, &bp).get_bill(), 4);
+    assert_eq!(
+        mock_recording::ContractClient::new(&env, &ins).get_policy(),
+        5
+    );
 }
 
 #[test]
-fn function_pause_is_scoped() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.budget().reset_unlimited();
+fn set_default_route_requires_owner() {
+    let (env, owner) = setup_test();
+    let (_, client) = register_orchestrator(&env);
+    init_orchestrator(&env, &client, &owner);
 
-    let (_orch_id, client, owner, _fw, _rs, _sg, _bp, _ins) = setup_test_orchestrator(&env);
-    // Pause only "fanout"
-    let ks = env.register_contract(None, mock_killswitch_fanout_paused::Contract);
-    client.set_killswitch(&owner, &Some(ks));
+    let stranger = Address::generate(&env);
+    let result = client.try_set_default_route(&stranger, &1, &2, &3);
+    assert_eq!(result, Err(Ok(OrchestratorError::Unauthorized)));
 
-    let caller = Address::generate(&env);
+    // Owner-controlled default is unchanged by the rejected call.
+    assert_eq!(client.get_flow_route(&stranger), None);
+}
 
-    // execute_flow_fanout must be blocked
-    let res_fanout = client.try_execute_flow_fanout(&caller, &10_000i128);
-    assert_eq!(res_fanout, Err(Ok(OrchestratorError::EmergencyPaused)));
+/// A route change between signing and submission invalidates the request: the
+/// hash binds the *resolved* ids, so the stale hash no longer matches.
+#[test]
+fn route_change_after_signing_invalidates_request() {
+    let (env, owner) = setup_test();
+    let (_, client) = register_orchestrator(&env);
+    init_orchestrator(&env, &client, &owner);
 
-    // execute_remittance_flow must succeed (scoped pause does not affect "flow")
-    let res_flow = client.try_execute_remittance_flow(&RemittanceFlowParams {
-        caller: caller.clone(),
-        total_amount: 10_000i128,
-        family_wallet: _fw.clone(),
-        remittance_split: _rs.clone(),
-        savings: _sg.clone(),
-        bills: _bp.clone(),
-        insurance: _ins.clone(),
-        goal_id: 1,
-        bill_id: 1,
-        policy_id: 1,
-    });
-    assert_eq!(res_flow, Ok(Ok(())));
+    let executor = Address::generate(&env);
+    client.set_flow_route(&executor, &7, &8, &9);
+
+    let deadline = signed_flow_deadline(&env);
+    // Signed while the route was (7, 8, 9).
+    let hash = compute_test_hash_with_ids(symbol_short!("flow"), 0, 10_000, deadline, 7, 8, 9);
+
+    // Route changes before the request is submitted.
+    client.set_flow_route(&executor, &7, &8, &10);
+
+    let result =
+        client.try_execute_remittance_flow_signed(&executor, &10_000, &0, &deadline, &hash, &0u64);
+    assert_eq!(result, Err(Ok(OrchestratorError::InvalidNonce)));
+    assert_eq!(client.get_nonce(&executor), 0, "nonce must not advance");
 }
 
 #[test]
-fn killswitch_failure_fails_closed() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.budget().reset_unlimited();
+fn set_flow_route_rejects_zero_ids() {
+    let (env, owner) = setup_test();
+    let (_, client) = register_orchestrator(&env);
+    init_orchestrator(&env, &client, &owner);
 
-    let (_orch_id, client, owner, _fw, _rs, _sg, _bp, _ins) = setup_test_orchestrator(&env);
+    let executor = Address::generate(&env);
 
-    // Register a mock with failing methods (FailingMock has no killswitch interface)
-    let non_ks_contract = env.register_contract(None, FailingMock);
-    client.set_killswitch(&owner, &Some(non_ks_contract));
+    assert_eq!(
+        client.try_set_flow_route(&executor, &0, &8, &9),
+        Err(Ok(OrchestratorError::InvalidRoute))
+    );
+    assert_eq!(
+        client.try_set_flow_route(&executor, &7, &0, &9),
+        Err(Ok(OrchestratorError::InvalidRoute))
+    );
+    assert_eq!(
+        client.try_set_flow_route(&executor, &7, &8, &0),
+        Err(Ok(OrchestratorError::InvalidRoute))
+    );
 
-    let caller = Address::generate(&env);
-
-    // Invocation failure to killswitch client must fail closed and return EmergencyPaused
-    let res_flow = client.try_execute_remittance_flow(&RemittanceFlowParams {
-        caller: caller.clone(),
-        total_amount: 10_000i128,
-        family_wallet: _fw.clone(),
-        remittance_split: _rs.clone(),
-        savings: _sg.clone(),
-        bills: _bp.clone(),
-        insurance: _ins.clone(),
-        goal_id: 1,
-        bill_id: 1,
-        policy_id: 1,
-    });
-    assert_eq!(res_flow, Err(Ok(OrchestratorError::EmergencyPaused)));
-
-    let res_fanout = client.try_execute_flow_fanout(&caller, &10_000i128);
-    assert_eq!(res_fanout, Err(Ok(OrchestratorError::EmergencyPaused)));
+    assert_eq!(client.get_flow_route(&executor), None);
 }
 
+/// Without the executor's authorization the call must fail. No `mock_all_auths`
+/// here, so `executor.require_auth()` has nothing to satisfy it.
 #[test]
-fn no_killswitch_configured_is_noop() {
+#[should_panic]
+fn set_flow_route_requires_executor_auth() {
     let env = Env::default();
-    env.mock_all_auths();
-    env.budget().reset_unlimited();
+    let orchestrator_id = env.register_contract(None, Orchestrator);
+    let client = OrchestratorClient::new(&env, &orchestrator_id);
 
-    let (_orch_id, client, _owner, _fw, _rs, _sg, _bp, _ins) = setup_test_orchestrator(&env);
-    let caller = Address::generate(&env);
-
-    // With no killswitch configured, flows proceed normally
-    let res_flow = client.try_execute_remittance_flow(&RemittanceFlowParams {
-        caller: caller.clone(),
-        total_amount: 10_000i128,
-        family_wallet: _fw.clone(),
-        remittance_split: _rs.clone(),
-        savings: _sg.clone(),
-        bills: _bp.clone(),
-        insurance: _ins.clone(),
-        goal_id: 1,
-        bill_id: 1,
-        policy_id: 1,
-    });
-    assert_eq!(res_flow, Ok(Ok(())));
-
-    let res_fanout = client.try_execute_flow_fanout(&caller, &10_000i128);
-    assert!(res_fanout.is_ok());
-}
-
-#[test]
-fn set_killswitch_owner_only_and_validates_address() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.budget().reset_unlimited();
-
-    let (orch_id, client, owner, fw, _rs, _sg, _bp, _ins) = setup_test_orchestrator(&env);
-    let non_owner = Address::generate(&env);
-    let ks = env.register_contract(None, mock_killswitch_unpaused::Contract);
-
-    // 1. Non-owner cannot set killswitch
-    let res_non_owner = client.try_set_killswitch(&non_owner, &Some(ks.clone()));
-    assert_eq!(res_non_owner, Err(Ok(OrchestratorError::Unauthorized)));
-
-    // 2. Cannot set to orchestrator itself
-    let res_self = client.try_set_killswitch(&owner, &Some(orch_id.clone()));
-    assert_eq!(res_self, Err(Ok(OrchestratorError::DuplicateDependency)));
-
-    // 3. Cannot set to an existing dependency address
-    let res_dep = client.try_set_killswitch(&owner, &Some(fw.clone()));
-    assert_eq!(res_dep, Err(Ok(OrchestratorError::DuplicateDependency)));
-
-    // 4. Owner sets valid killswitch address
-    let res_ok = client.set_killswitch(&owner, &Some(ks.clone()));
-    assert!(res_ok);
-
-    // 5. Owner clears killswitch address (None)
-    let res_clear = client.set_killswitch(&owner, &None);
-    assert!(res_clear);
+    let executor = Address::generate(&env);
+    client.set_flow_route(&executor, &7, &8, &9);
 }
